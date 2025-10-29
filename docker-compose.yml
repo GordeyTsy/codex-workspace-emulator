@@ -1,0 +1,92 @@
+x-workspace-common: &workspace-common
+  depends_on:
+    proxy:
+      condition: service_healthy
+  environment:
+    CODEX_ENV_PYTHON_VERSION: "3.12"
+    CODEX_ENV_NODE_VERSION: "20"
+    CODEX_ENV_RUBY_VERSION: "3.4.4"
+    CODEX_ENV_RUST_VERSION: "1.89.0"
+    CODEX_ENV_GO_VERSION: "1.24.3"
+    CODEX_ENV_SWIFT_VERSION: "6.1"
+    CODEX_ENV_PHP_VERSION: "8.4"
+    CODEX_ENV_BUN_VERSION: "1.2.14"
+    CODEX_ENV_JAVA_VERSION: "21"
+    HTTP_PROXY: "http://proxy:8080"
+    HTTPS_PROXY: "http://proxy:8080"
+    http_proxy: "http://proxy:8080"
+    https_proxy: "http://proxy:8080"
+    HOST_REPO_NAME: "${HOST_REPO_NAME:-project}"
+    NO_PROXY: "localhost,127.0.0.1,::1"
+    no_proxy: "localhost,127.0.0.1,::1"
+    REQUESTS_CA_BUNDLE: "/usr/local/share/ca-certificates/envoy-mitmproxy-ca-cert.crt"
+    SSL_CERT_FILE: "/usr/local/share/ca-certificates/envoy-mitmproxy-ca-cert.crt"
+    PIP_CERT: "/usr/local/share/ca-certificates/envoy-mitmproxy-ca-cert.crt"
+    NODE_EXTRA_CA_CERTS: "/usr/local/share/ca-certificates/envoy-mitmproxy-ca-cert.crt"
+    CODEX_PROXY_CERT: "/usr/local/share/ca-certificates/envoy-mitmproxy-ca-cert.crt"
+    GRADLE_OPTS: "-Dhttp.proxyHost=proxy -Dhttp.proxyPort=8080 -Dhttps.proxyHost=proxy -Dhttps.proxyPort=8080"
+    ELECTRON_GET_USE_PROXY: "true"
+    UV_NO_PROGRESS: "1"
+    WORKSPACE_ROOT: "/workspace/project"
+  volumes:
+    - type: bind
+      source: ${HOST_REPO:?Set HOST_REPO to the repository root}/.git
+      target: /host/.git
+      read_only: true
+    - mitm_certs:/mitmproxy
+  networks:
+    workspace_net:
+      aliases:
+        - workspace
+  tty: true
+  stdin_open: true
+  working_dir: /workspace/project
+
+services:
+  proxy:
+    image: mitmproxy/mitmproxy:10.3.0
+    command:
+      - mitmdump
+      - "--listen-host"
+      - "0.0.0.0"
+      - "--listen-port"
+      - "8080"
+      - "--mode"
+      - "regular"
+      - "--set"
+      - "block_global=false"
+      - "-s"
+      - "/etc/mitmproxy/https-only.py"
+    volumes:
+      - mitm_certs:/home/mitmproxy/.mitmproxy
+      - ./mitmproxy/https_only.py:/etc/mitmproxy/https-only.py:ro
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks:
+      workspace_net:
+        aliases:
+          - proxy
+      internet: {}
+    restart: unless-stopped
+
+  workspace:
+    <<: *workspace-common
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: codex-workspace-emulator:latest
+
+  workspace-cache:
+    <<: *workspace-common
+    image: codex-workspace-emulator:cached
+
+volumes:
+  mitm_certs:
+
+networks:
+  workspace_net:
+    internal: true
+  internet: {}

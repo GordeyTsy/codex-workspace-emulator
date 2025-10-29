@@ -15,6 +15,7 @@ RUN apt-get update \
         sudo=1.9.* \
         build-essential=12.10* \
         bzr=2.7.* \
+        ca-certificates=20240203* \
         curl=8.5.* \
         default-libmysqlclient-dev=1.1.* \
         dnsutils=1:9.18.* \

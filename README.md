@@ -1,69 +1,128 @@
-# codex-universal
+# codex-workspace-emulator
 
-`codex-universal` is a reference implementation of the base Docker image available in [OpenAI Codex](http://platform.openai.com/docs/codex).
+`codex-workspace-emulator` is a local replica of the base image used by OpenAI Codex workspaces. It keeps the language toolchain layout that ships with the public `ghcr.io/openai/codex-universal` image, but lets you build and run everything locally via Docker Compose. The project now mirrors the key Codex workspace constraints:
 
-This repository is intended to help developers cutomize environments in Codex, by providing a similar image that can be pulled and run locally. This is not an identical environment but should help for debugging and development.
+- Every container is built from a local image (`codex-workspace-emulator:latest`).
+- Only files tracked by git (HEAD) are copied into the container at runtime.
+- Setup scripts can optionally pre-warm and reuse a cached image layer.
+- All outbound traffic must use the bundled MITM proxy and HTTPS; WebSockets and direct connections are blocked.
 
-For more details on environment setup, see [OpenAI Codex](http://platform.openai.com/docs/codex).
+## Prerequisites
 
-## Usage
+- Docker 24.0+ with the Compose plugin.
+- Access to the repository whose `.git` directory you want to emulate.
+- GNU coreutils (for `realpath`) or Python 3 (the launcher falls back to `python3`).
 
-The Docker image is available at:
+## Quick start
 
-```
-docker pull ghcr.io/openai/codex-universal:latest
-```
-
-This repository builds the image for both linux/amd64 and linux/arm64. However we only run the linux/amd64 version.
-Your installed Docker may support linux/amd64 emulation by passing the `--platform linux/amd64` flag.
-
-The arm64 image differs from the amd64 image in 2 ways:
-- OpenJDK 10 is not available on amd64
-- The arm64 image skips installing swift because of a current bug with mise
-
-The below script shows how can you approximate the `setup` environment in Codex:
-
-```sh
-# See below for environment variable options.
-# This script mounts the current directory similar to how it would get cloned in.
-docker run --rm -it \
-    -e CODEX_ENV_PYTHON_VERSION=3.12 \
-    -e CODEX_ENV_NODE_VERSION=20 \
-    -e CODEX_ENV_RUST_VERSION=1.87.0 \
-    -e CODEX_ENV_GO_VERSION=1.23.8 \
-    -e CODEX_ENV_SWIFT_VERSION=6.2 \
-    -e CODEX_ENV_RUBY_VERSION=3.4.4 \
-    -e CODEX_ENV_PHP_VERSION=8.4 \
-    -v $(pwd):/workspace/$(basename $(pwd)) -w /workspace/$(basename $(pwd)) \
-    ghcr.io/openai/codex-universal:latest
+```bash
+./scripts/run-workspace.sh /path/to/your/repo
 ```
 
-`codex-universal` includes setup scripts that look for `CODEX_ENV_*` environment variables and configures the language version accordingly.
+What happens:
 
-### Configuring language runtimes
+1. The script builds `codex-workspace-emulator:latest` if needed (`docker compose build workspace`).
+2. It launches the embedded `mitmproxy` service and the `workspace` container.
+3. Only tracked files from `HEAD` are materialised inside `/workspace/project`.
+4. If `codex-workspace-scripts/setup-script.sh` exists, the script runs inside an isolated container. If it finishes successfully and `setup-from-cache-script.sh` is present, a snapshot is committed to `codex-workspace-emulator:cached` and replayed in a second container to exercise the cached path.
+5. When neither setup script is present, you drop into an interactive Bash shell with the Codex runtime configuration pre-applied.
 
-The following environment variables can be set to configure runtime installation. Note that a limited subset of versions are supported (indicated in the table below):
+The script accepts an optional path; by default it uses the current working directory.
 
-| Environment variable       | Description                | Supported versions                               | Additional packages                                                  |
-| -------------------------- | -------------------------- | ------------------------------------------------ | -------------------------------------------------------------------- |
-| `CODEX_ENV_PYTHON_VERSION` | Python version to install  | `3.10`, `3.11.12`, `3.12`, `3.13`, `3.14.0`        | `pyenv`, `poetry`, `uv`, `ruff`, `black`, `mypy`, `pyright`, `isort` |
-| `CODEX_ENV_NODE_VERSION`   | Node.js version to install | `18`, `20`, `22`                                 | `corepack`, `yarn`, `pnpm`, `npm`                                    |
-| `CODEX_ENV_RUST_VERSION`   | Rust version to install    | `1.83.0`, `1.84.1`, `1.85.1`, `1.86.0`, `1.87.0` |                                                                      |
-| `CODEX_ENV_GO_VERSION`     | Go version to install      | `1.22.12`, `1.23.8`, `1.24.3`, `1.25.1`           |                                                                      |
-| `CODEX_ENV_SWIFT_VERSION`  | Swift version to install   | `5.10`, `6.1`, `6.2`                              |                                                                      |
-| `CODEX_ENV_RUBY_VERSION`   | Ruby version to install  | `3.2.3`, `3.3.8`, `3.4.4`                |                                                                      |
-| `CODEX_ENV_PHP_VERSION`   | PHP version to install  | `8.4`, `8.3`, `8.2`                |                                                                      |
+## Repository projection
 
+- Only the `.git` directory from the host is mounted (read-only).
+- The entrypoint clones HEAD into `/workspace/project` by copying `.git` and running `git reset --hard HEAD`.
+- Submodules are synced and updated recursively (unless `CODEX_SKIP_SUBMODULES=1`).
+- Changes inside the container do not affect your host checkout or `.git` data.
 
+This mirrors the Codex workspace behaviour where the workspace always starts from a clean commit snapshot.
 
-## What's included
+## Setup scripts contract
 
-In addition to the packages specified in the table above, the following packages are also installed:
+If the project root contains `codex-workspace-scripts/`:
 
-- `bun`: 1.2.10
-- `java`: 21
-- `bazelisk` / `bazel`
-- `erlang`: 27.1.2
-- `elixir`: 1.18.3
+- `setup-script.sh` is **required** and is executed in a fresh container. Use it to build caches, download dependencies, and mutate the image.
+- `setup-from-cache-script.sh` is **optional**. When present, the launcher saves the container state after `setup-script.sh` (`docker commit codex-workspace-emulator:cached`) and then runs this second script from the cached image to mimic the "cache hit" path.
+- When setup scripts exist, the containers run to completion and exit; you do not get an interactive shell by default.
 
-See [Dockerfile](Dockerfile) for the full details of installed packages.
+All output from both scripts is streamed to your terminal. Any non-zero exit from either script stops the workflow and preserves the relevant logs.
+
+## Networking & proxy restrictions
+
+The Docker Compose stack defines two services:
+
+- `proxy`: Runs `mitmdump` with a codified policy that only allows HTTPS traffic and rejects WebSocket upgrades. It owns a shared volume containing the generated CA certificate.
+- `workspace` / `workspace-cache`: Run the Codex image. They are attached only to an internal Docker network and can reach the Internet exclusively through the `proxy` container.
+
+The workspace containers export the same proxy-related environment variables used in Codex (e.g. `HTTP_PROXY=http://proxy:8080`, `NO_PROXY=localhost,127.0.0.1,::1`, `NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/envoy-mitmproxy-ca-cert.crt`). On startup, the entrypoint waits for the proxy CA certificate, installs it into the system trust store, and sets `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`, `PIP_CERT`, and related variables.
+
+Because the containers live on an internal-only network, any attempt to bypass the proxy is blocked. The proxy script also rejects WebSocket (`wss`) traffic so that only HTTPS requests succeed.
+
+## Running services manually
+
+You can interact with docker-compose directly if you prefer:
+
+```bash
+export HOST_REPO=$(pwd)
+export HOST_REPO_NAME=$(basename "$HOST_REPO")
+
+# Build the base image
+docker compose build workspace
+
+# Interactive shell without setup scripts
+docker compose run --rm workspace
+
+# Run setup scripts explicitly
+docker compose run --name codex-setup workspace run-setup
+docker commit codex-setup codex-workspace-emulator:cached
+docker rm codex-setup
+docker compose run --rm workspace-cache run-setup-from-cache
+
+# Stop auxiliary services
+docker compose down --remove-orphans
+```
+
+The `scripts/run-workspace.sh` helper wraps the lifecycle above, including container cleanup and cache management.
+
+### Self-test project
+
+To verify the emulator end-to-end, run the bundled smoke test:
+
+```bash
+./tests/run-example-tests.sh
+```
+
+It bootstraps a throwaway git repository under `tests/example-project`, executes both setup phases, and asserts that:
+- only tracked files appear inside the workspace
+- HTTPS succeeds via the proxy while HTTP, websocket upgrades, and direct connections fail
+- cache snapshots persist state between `setup-script.sh` and `setup-from-cache-script.sh`
+
+## Environment configuration
+
+The entrypoint exports the following defaults on container start (all overridable through Compose or the launcher):
+
+| Variable | Default |
+| -------- | ------- |
+| `CODEX_ENV_PYTHON_VERSION` | `3.12` |
+| `CODEX_ENV_NODE_VERSION` | `20` |
+| `CODEX_ENV_RUST_VERSION` | `1.89.0` |
+| `CODEX_ENV_GO_VERSION` | `1.24.3` |
+| `CODEX_ENV_SWIFT_VERSION` | `6.1` |
+| `CODEX_ENV_RUBY_VERSION` | `3.4.4` |
+| `CODEX_ENV_PHP_VERSION` | `8.4` |
+| `CODEX_ENV_BUN_VERSION` | `1.2.14` |
+| `CODEX_ENV_JAVA_VERSION` | `21` |
+
+Adjust these via `docker compose run -e CODEX_ENV_NODE_VERSION=22 workspace …` or by editing `docker-compose.yml`.
+
+## Troubleshooting
+
+- **"HOST_REPO is not set"** – Export `HOST_REPO` (and optionally `HOST_REPO_NAME`) before using `docker compose run`, or always use `./scripts/run-workspace.sh`.
+- **Missing mitmproxy certificate** – Ensure the `proxy` service stays healthy; the workspace waits up to 30 seconds for the certificate volume to be populated.
+- **Setup script failures** – The helper exits on the first non-zero status. Fix the script locally and rerun; the cached image is only updated after a successful run.
+- **Need to skip submodules** – Run with `CODEX_SKIP_SUBMODULES=1 ./scripts/run-workspace.sh` to avoid initializing them.
+
+## License
+
+This project inherits the original licensing information in [LICENSES](LICENSES).

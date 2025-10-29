@@ -1,1 +1,4 @@
 .DS_Store
+tests/example-project/.git/
+tests/example-project/untracked.txt
+.idea/
